@@ -1,0 +1,199 @@
+name: 'attacks.ai Agent Security Scan'
+description: 'Test your AI agent for prompt injection, data exfiltration, credential confusion, and excessive agency'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  api-key:
+    description: 'attacks.ai API key (atk_...)'
+    required: true
+  agent-command:
+    description: 'Command to run your agent. The scan URL is available as $SCAN_URL. If omitted, the action only creates the scan and outputs the URL.'
+    required: false
+  provider:
+    description: 'Provider hint (openai, anthropic, google, etc.)'
+    required: false
+  wait-timeout:
+    description: 'Max seconds to wait for scan completion (default: 300)'
+    required: false
+    default: '300'
+  fail-on:
+    description: 'CI gate threshold: "fail" (default), "warn", or "any"'
+    required: false
+    default: 'fail'
+
+outputs:
+  scan-id:
+    description: 'Scan ID'
+    value: ${{ steps.scan.outputs.scan-id }}
+  scan-url:
+    description: 'URL to send your agent to'
+    value: ${{ steps.scan.outputs.scan-url }}
+  session-id:
+    description: 'Session ID (available after completion)'
+    value: ${{ steps.poll.outputs.session-id }}
+  status:
+    description: 'Overall status: all-clear, moderate, high-risk, critical'
+    value: ${{ steps.results.outputs.status }}
+  ci-gate:
+    description: 'CI gate: pass, warn, fail'
+    value: ${{ steps.results.outputs.ci-gate }}
+  results-url:
+    description: 'URL to the full report'
+    value: ${{ steps.results.outputs.results-url }}
+  findings:
+    description: 'Total findings count'
+    value: ${{ steps.results.outputs.findings }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Create scan
+      id: scan
+      shell: bash
+      env:
+        ATK_API_KEY: ${{ inputs.api-key }}
+        ATK_PROVIDER: ${{ inputs.provider }}
+      run: |
+        BODY='{}'
+        if [ -n "$ATK_PROVIDER" ]; then
+          BODY=$(printf '{"provider":"%s"}' "$ATK_PROVIDER")
+        fi
+
+        RESPONSE=$(curl -sf -X POST \
+          -H "Authorization: Bearer $ATK_API_KEY" \
+          -H "Content-Type: application/json" \
+          -d "$BODY" \
+          https://attacks.ai/api/scan)
+
+        if [ $? -ne 0 ]; then
+          echo "::error::Failed to create scan. Check your API key."
+          exit 1
+        fi
+
+        SCAN_ID=$(echo "$RESPONSE" | jq -r '.scanId')
+        SCAN_URL=$(echo "$RESPONSE" | jq -r '.url')
+
+        echo "scan-id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+        echo "scan-url=$SCAN_URL" >> "$GITHUB_OUTPUT"
+        echo "::notice::Scan created: $SCAN_ID"
+
+    - name: Run agent
+      if: inputs.agent-command != ''
+      shell: bash
+      env:
+        SCAN_URL: ${{ steps.scan.outputs.scan-url }}
+      run: ${{ inputs.agent-command }}
+
+    - name: Poll for completion
+      id: poll
+      if: inputs.agent-command != ''
+      shell: bash
+      env:
+        ATK_API_KEY: ${{ inputs.api-key }}
+        SCAN_ID: ${{ steps.scan.outputs.scan-id }}
+        TIMEOUT: ${{ inputs.wait-timeout }}
+      run: |
+        ELAPSED=0
+        INTERVAL=5
+        echo "Waiting for scan $SCAN_ID to complete (timeout: ${TIMEOUT}s)..."
+
+        while [ "$ELAPSED" -lt "$TIMEOUT" ]; do
+          POLL=$(curl -sf \
+            -H "Authorization: Bearer $ATK_API_KEY" \
+            "https://attacks.ai/api/scan/$SCAN_ID")
+
+          STATUS=$(echo "$POLL" | jq -r '.status')
+
+          if [ "$STATUS" = "completed" ]; then
+            SESSION_ID=$(echo "$POLL" | jq -r '.sessionId')
+            echo "session-id=$SESSION_ID" >> "$GITHUB_OUTPUT"
+            echo "::notice::Scan complete. Session: $SESSION_ID"
+            exit 0
+          fi
+
+          if [ "$STATUS" = "expired" ] || [ "$STATUS" = "failed" ]; then
+            echo "::error::Scan $STATUS"
+            exit 1
+          fi
+
+          sleep $INTERVAL
+          ELAPSED=$((ELAPSED + INTERVAL))
+
+          # Back off after first minute
+          if [ "$ELAPSED" -ge 60 ] && [ "$INTERVAL" -lt 15 ]; then
+            INTERVAL=15
+          fi
+        done
+
+        echo "::error::Scan timed out after ${TIMEOUT}s"
+        exit 1
+
+    - name: Fetch results
+      id: results
+      if: steps.poll.outputs.session-id != ''
+      shell: bash
+      env:
+        ATK_API_KEY: ${{ inputs.api-key }}
+        SESSION_ID: ${{ steps.poll.outputs.session-id }}
+        FAIL_ON: ${{ inputs.fail-on }}
+      run: |
+        REPORT=$(curl -sf \
+          -H "Authorization: Bearer $ATK_API_KEY" \
+          "https://attacks.ai/api/results/$SESSION_ID")
+
+        if [ $? -ne 0 ]; then
+          echo "::error::Failed to fetch results for session $SESSION_ID"
+          exit 1
+        fi
+
+        STATUS=$(echo "$REPORT" | jq -r '.status')
+        CI_GATE=$(echo "$REPORT" | jq -r '.ciGateStatus')
+        FINDINGS=$(echo "$REPORT" | jq -r '.scoringSummary.totalFindings // 0')
+
+        echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+        echo "ci-gate=$CI_GATE" >> "$GITHUB_OUTPUT"
+        echo "findings=$FINDINGS" >> "$GITHUB_OUTPUT"
+        echo "results-url=https://attacks.ai/results/$SESSION_ID" >> "$GITHUB_OUTPUT"
+
+        # Summary table
+        echo "## Agent Security Report" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Metric | Value |" >> "$GITHUB_STEP_SUMMARY"
+        echo "|--------|-------|" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Status | \`$STATUS\` |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| CI Gate | \`$CI_GATE\` |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Findings | $FINDINGS |" >> "$GITHUB_STEP_SUMMARY"
+        echo "| Report | [View full report](https://attacks.ai/results/$SESSION_ID) |" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        # Per-category breakdown
+        for CAT in prompt-injection data-exfiltration excessive-agency credential-confusion; do
+          CAT_STATUS=$(echo "$REPORT" | jq -r ".scoringSummary.categories[\"$CAT\"].status // \"untested\"")
+          echo "| $CAT | \`$CAT_STATUS\` |" >> "$GITHUB_STEP_SUMMARY"
+        done
+
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "*Tested by [attacks.ai](https://attacks.ai)*" >> "$GITHUB_STEP_SUMMARY"
+
+        # Gate check
+        SHOULD_FAIL=false
+        case "$FAIL_ON" in
+          fail)
+            [ "$CI_GATE" = "fail" ] && SHOULD_FAIL=true
+            ;;
+          warn)
+            [ "$CI_GATE" = "fail" ] || [ "$CI_GATE" = "warn" ] && SHOULD_FAIL=true
+            ;;
+          any)
+            [ "$CI_GATE" != "pass" ] && SHOULD_FAIL=true
+            ;;
+        esac
+
+        if [ "$SHOULD_FAIL" = "true" ]; then
+          echo "::error::Agent security gate: $CI_GATE ($STATUS, $FINDINGS findings)"
+          exit 1
+        fi
+
+        echo "::notice::Agent security gate: $CI_GATE ($STATUS)"
