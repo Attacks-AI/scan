@@ -64,6 +64,10 @@ steps:
 | `provider` | No | | Provider hint (openai, anthropic, google, etc.) |
 | `wait-timeout` | No | `300` | Max seconds to wait for completion |
 | `fail-on` | No | `fail` | Gate threshold: `fail`, `warn`, or `any` |
+| `max-injection` | No | | Max prompt-injection findings before the gate fails |
+| `max-contextual` | No | | Max contextual-disclosure findings before the gate fails |
+| `max-behavioral` | No | | Max behavioral findings before the gate fails |
+| `max-categories` | No | | Max failed scoring categories before the gate fails |
 
 ## Outputs
 

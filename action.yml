@@ -22,6 +22,18 @@ inputs:
     description: 'CI gate threshold: "fail" (default), "warn", or "any"'
     required: false
     default: 'fail'
+  max-injection:
+    description: 'Max allowed prompt-injection findings before the gate fails (per-vector threshold)'
+    required: false
+  max-contextual:
+    description: 'Max allowed contextual-disclosure findings before the gate fails'
+    required: false
+  max-behavioral:
+    description: 'Max allowed behavioral findings before the gate fails'
+    required: false
+  max-categories:
+    description: 'Max allowed failed scoring categories before the gate fails'
+    required: false
 
 outputs:
   scan-id:
@@ -138,19 +150,35 @@ runs:
         ATK_API_KEY: ${{ inputs.api-key }}
         SESSION_ID: ${{ steps.poll.outputs.session-id }}
         FAIL_ON: ${{ inputs.fail-on }}
+        MAX_INJECTION: ${{ inputs.max-injection }}
+        MAX_CONTEXTUAL: ${{ inputs.max-contextual }}
+        MAX_BEHAVIORAL: ${{ inputs.max-behavioral }}
+        MAX_CATEGORIES: ${{ inputs.max-categories }}
       run: |
+        # Build the per-vector gate query string from any supplied thresholds.
+        QS=""
+        [ -n "$MAX_INJECTION" ]  && QS="${QS}&maxInjection=${MAX_INJECTION}"
+        [ -n "$MAX_CONTEXTUAL" ] && QS="${QS}&maxContextual=${MAX_CONTEXTUAL}"
+        [ -n "$MAX_BEHAVIORAL" ] && QS="${QS}&maxBehavioral=${MAX_BEHAVIORAL}"
+        [ -n "$MAX_CATEGORIES" ] && QS="${QS}&maxCategories=${MAX_CATEGORIES}"
+        QS="${QS#&}"
+        URL="https://attacks.ai/api/results/$SESSION_ID"
+        [ -n "$QS" ] && URL="${URL}?${QS}"
+
         REPORT=$(curl -sf \
           -H "Authorization: Bearer $ATK_API_KEY" \
-          "https://attacks.ai/api/results/$SESSION_ID")
+          "$URL")
 
         if [ $? -ne 0 ]; then
           echo "::error::Failed to fetch results for session $SESSION_ID"
           exit 1
         fi
 
-        STATUS=$(echo "$REPORT" | jq -r '.status')
+        STATUS=$(echo "$REPORT" | jq -r '.score.overallStatus // "unknown"')
         CI_GATE=$(echo "$REPORT" | jq -r '.ciGateStatus')
-        FINDINGS=$(echo "$REPORT" | jq -r '.scoringSummary.totalFindings // 0')
+        # scoringSummary is a flat { [category]: {status,...} } map; total findings
+        # live on .score.totalFindings.
+        FINDINGS=$(echo "$REPORT" | jq -r '.score.totalFindings // 0')
 
         echo "status=$STATUS" >> "$GITHUB_OUTPUT"
         echo "ci-gate=$CI_GATE" >> "$GITHUB_OUTPUT"
@@ -170,7 +198,7 @@ runs:
 
         # Per-category breakdown
         for CAT in prompt-injection data-exfiltration excessive-agency credential-confusion; do
-          CAT_STATUS=$(echo "$REPORT" | jq -r ".scoringSummary.categories[\"$CAT\"].status // \"untested\"")
+          CAT_STATUS=$(echo "$REPORT" | jq -r ".scoringSummary[\"$CAT\"].status // \"untested\"")
           echo "| $CAT | \`$CAT_STATUS\` |" >> "$GITHUB_STEP_SUMMARY"
         done
 
